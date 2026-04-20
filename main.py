@@ -1,14 +1,25 @@
+"""
+Detectie placuta de inmatriculare.
+  1. Canny
+  2. Closing minimal (3x3) — doar inchide micro-goluri
+  3. Detectia de conturur
+  4. minAreaRect (AABB + Brute Force Rotation)
+  5. Filtrare geometrica + scoring cu
+     - densitate muchii (pe edges)
+     - contrast grayscale (deviatie standard pe imaginea originala)
+     - aspect ratio, pozitie, arie
+  6. warpPerspective pt decupare
+"""
+
 import sys
 from collections import deque
+
 import cv2
 from tkinter import Tk, filedialog
+
 import numpy as np
-import pytesseract
-pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
-from PIL import Image
 
-
-def select_image():
+def select_image() -> str | None:
     root = Tk()
     root.withdraw()
     path = filedialog.askopenfilename(
@@ -20,14 +31,14 @@ def select_image():
     return path or None
 
 
-def load_image(path: str):
+def load_image(path: str) -> cv2.typing.MatLike:
     image = cv2.imread(path)
     if image is None:
         print(f"Could not load image: {path}")
         sys.exit(1)
     return image
 
-def convolution(IS: np.ndarray, H: np.ndarray):
+def convolution(IS, H):
     IS = IS.astype(np.float64)
     H = H.astype(np.float64)
     w = H.shape[0]
@@ -36,28 +47,25 @@ def convolution(IS: np.ndarray, H: np.ndarray):
     ID = np.zeros((rows, cols), dtype=np.float64)
     for u in range(w):
         for v in range(w):
-            ID[k:rows-k, k:cols-k] += (H[u, v] * IS[k + u - k:rows - k + u - k, k + v - k:cols - k + v - k])
+            ID[k:rows - k, k:cols - k] += (H[u, v] * IS[k + u - k:rows - k + u - k, k + v - k:cols - k + v - k])
     return ID
 
 
-def gaussian_kernel(w: int, sigma: float):
+def gaussian_kernel(w, sigma):
     x0 = w // 2
-    y0 = w // 2
     G = np.zeros((w, w), dtype=np.float64)
     for y in range(w):
         for x in range(w):
-            G[y, x] = (1.0 / (2.0 * np.pi * sigma ** 2)) * np.exp(-((x-x0) ** 2 + (y-y0) ** 2) / (2.0 * sigma ** 2))
+            G[y, x] = (1.0 / (2.0 * np.pi * sigma ** 2)) * np.exp(-((x - x0) ** 2 + (y - x0) ** 2) / (2.0 * sigma ** 2))
     G /= G.sum()
     return G
 
 
-def gaussian_filter(img: np.ndarray, w: int = 5):
-    sigma = w / 6.0
-    G = gaussian_kernel(w, sigma)
-    return convolution(img, G)
+def gaussian_filter(img, w=5):
+    return convolution(img, gaussian_kernel(w, w / 6.0))
 
 
-def sobel(img: np.ndarray):
+def sobel(img):
     Hx = np.array([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=np.float64)
     Hy = np.array([[1, 2, 1], [0, 0, 0], [-1, -2, -1]], dtype=np.float64)
     fx = convolution(img, Hx)
@@ -65,10 +73,10 @@ def sobel(img: np.ndarray):
     modul = np.sqrt(fx ** 2 + fy ** 2)
     dir = np.rad2deg(np.arctan2(fy, fx))
     dir[dir < 0] += 360
-    dir[dir > 360] -= 360
     return modul, dir
 
-def directie(angle: float):
+
+def directie(angle):
     a = angle % 360
     if (0 <= a < 22.5) or (157.5 <= a < 202.5) or (337.5 <= a < 360):
         return 0
@@ -79,85 +87,84 @@ def directie(angle: float):
     else:
         return 3
 
-def keep_local_max(modul: np.ndarray, dir: np.ndarray):
+
+def keep_local_max(modul, dir):
     rows, cols = modul.shape
     result = np.zeros_like(modul)
-    for i in range(1, rows-1):
-        for j in range(1, cols-1):
+    for i in range(1, rows - 1):
+        for j in range(1, cols - 1):
             d = directie(dir[i, j])
             if d == 0:
-                v1 = modul[i, j-1]; v2 = modul[i, j+1]
+                v1, v2 = modul[i, j - 1], modul[i, j + 1]
             elif d == 1:
-                v1 = modul[i-1, j+1]; v2 = modul[i+1, j-1]
+                v1, v2 = modul[i - 1, j + 1], modul[i + 1, j - 1]
             elif d == 2:
-                v1 = modul[i-1, j]; v2 = modul[i+1, j]
+                v1, v2 = modul[i - 1, j], modul[i + 1, j]
             else:
-                v1 = modul[i-1, j-1]; v2 = modul[i+1, j+1]
+                v1, v2 = modul[i - 1, j - 1], modul[i + 1, j + 1]
             if modul[i, j] > v1 and modul[i, j] > v2:
                 result[i, j] = modul[i, j]
     return result
 
-def adaptive_binarization(modul_nms: np.ndarray, p: float = 0.1):
-    normalized_module = np.clip(modul_nms / (4.0*np.sqrt(2.0)), 0, 255).astype(np.int32)
-    histogram = np.zeros(256, dtype=np.int64)
-    rows, cols = normalized_module.shape
+
+def adaptive_binarization(modul_nms, p=0.1):
+    nm = np.clip(modul_nms / (4.0 * np.sqrt(2.0)), 0, 255).astype(np.int32)
+    hist = np.zeros(256, dtype=np.int64)
+    rows, cols = nm.shape
     for i in range(rows):
         for j in range(cols):
-            histogram[normalized_module[i, j]] += 1
-    nr_non_muchie = int((1.0-p) * (rows * cols - histogram[0]))
-    sum = 0
-    adaptive_threshold = 1
+            hist[nm[i, j]] += 1
+    nr = int((1.0 - p) * (rows * cols - hist[0]))
+    s = 0
+    thr = 1
     for i in range(1, 256):
-        sum += histogram[i]
-        if sum >= nr_non_muchie:
-            adaptive_threshold = i
+        s += hist[i]
+        if s >= nr:
+            thr = i
             break
-    return adaptive_threshold, normalized_module
+    return thr, nm
 
-def histeresis(modul_norm: np.ndarray, adaptive_threshold: int, k: float = 0.4):
-    rows, cols = modul_norm.shape
-    high_threshold = adaptive_threshold
-    low_threshold = k * high_threshold
+
+def histeresis(mn, thr, k=0.4):
+    rows, cols = mn.shape
+    lo = k * thr
     result = np.zeros((rows, cols), dtype=np.uint8)
     for i in range(rows):
         for j in range(cols):
-            value = modul_norm[i, j]
-            if value > high_threshold:
+            if mn[i, j] > thr:
                 result[i, j] = 255
-            elif value > low_threshold:
+            elif mn[i, j] > lo:
                 result[i, j] = 128
     q = deque()
-    for i in range(1, rows-1):
-        for j in range(1, cols-1):
+    for i in range(1, rows - 1):
+        for j in range(1, cols - 1):
             if result[i, j] == 255:
                 q.append((i, j))
     while q:
         ci, cj = q.popleft()
         for di in [-1, 0, 1]:
             for dj in [-1, 0, 1]:
-                if di == 0 and dj == 0:
-                    continue
+                if di == 0 and dj == 0: continue
                 ni, nj = ci + di, cj + dj
-                if 0 <= ni < rows and 0 <= nj < cols:
-                    if result[ni, nj] == 128:
-                        result[ni, nj] = 255
-                        q.append((ni, nj))
+                if 0 <= ni < rows and 0 <= nj < cols and result[ni, nj] == 128:
+                    result[ni, nj] = 255
+                    q.append((ni, nj))
     result[result == 128] = 0
     return result
 
-def canny(image: cv2.typing.MatLike, gauss_w: int = 5, p: float = 0.1, k: float = 0.4):
+
+def canny(image, gauss_w=5, p=0.1, k=0.4):
     if image.ndim == 3:
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY).astype(np.float64)
     else:
         gray = image.astype(np.float64)
     filtered = gaussian_filter(gray, gauss_w)
-    module, dir = sobel(filtered)
-    nms_module = keep_local_max(module, dir)
-    adaptive_threshold, module_norm = adaptive_binarization(nms_module, p)
-    edges = histeresis(module_norm, adaptive_threshold, k)
-    return edges
+    modul, dir = sobel(filtered)
+    nms = keep_local_max(modul, dir)
+    thr, mn = adaptive_binarization(nms, p)
+    return histeresis(mn, thr, k)
 
-def dilation(img: np.ndarray, element: np.ndarray):
+def dilatare(img, element):
     rows, cols = img.shape
     kh, kw = element.shape
     ph, pw = kh // 2, kw // 2
@@ -170,7 +177,7 @@ def dilation(img: np.ndarray, element: np.ndarray):
     return result
 
 
-def erosion(img: np.ndarray, element: np.ndarray):
+def eroziune(img, element):
     rows, cols = img.shape
     kh, kw = element.shape
     ph, pw = kh // 2, kw // 2
@@ -183,18 +190,16 @@ def erosion(img: np.ndarray, element: np.ndarray):
     return result
 
 
-def closing(img: np.ndarray, element: np.ndarray):
-    return erosion(dilation(img, element), element)
+def closing(img, element):
+    return eroziune(dilatare(img, element), element)
 
 
-def detect_contours(img_bin: np.ndarray):
+def find_contours_lab6(img_bin):
     rows, cols = img_bin.shape
     padded = np.zeros((rows + 2, cols + 2), dtype=np.uint8)
-    padded[1:rows+1, 1:cols+1] = img_bin
+    padded[1:rows + 1, 1:cols + 1] = img_bin
     visited = np.zeros_like(padded, dtype=bool)
-
-    dirs = [(0,1),(-1,1),(-1,0),(-1,-1),(0,-1),(1,-1),(1,0),(1,1)]
-
+    dirs = [(0, 1), (-1, 1), (-1, 0), (-1, -1), (0, -1), (1, -1), (1, 0), (1, 1)]
     contours = []
 
     def trace(sr, sc):
@@ -208,31 +213,25 @@ def detect_contours(img_bin: np.ndarray):
             dd = (ss + step) % 8
             nr, nc = sr + dirs[dd][0], sc + dirs[dd][1]
             if padded[nr, nc] == 255:
-                P1 = (nr, nc)
-                d = dd
+                P1 = (nr, nc);
+                d = dd;
                 break
-        if P1 is None:
-            return pts
+        if P1 is None: return pts
         pts.append(P1)
         visited[P1[0], P1[1]] = True
         prev, curr = P0, P1
-        for _ in range(2 * (rows+2) * (cols+2)):
-            if d % 2 == 0:
-                ss = (d + 7) % 8
-            else:
-                ss = (d + 6) % 8
+        for _ in range(2 * (rows + 2) * (cols + 2)):
+            ss = (d + 7) % 8 if d % 2 == 0 else (d + 6) % 8
             nxt = None
             for step in range(8):
                 dd = (ss + step) % 8
                 nr, nc = curr[0] + dirs[dd][0], curr[1] + dirs[dd][1]
                 if padded[nr, nc] == 255:
-                    nxt = (nr, nc)
-                    d = dd
+                    nxt = (nr, nc);
+                    d = dd;
                     break
-            if nxt is None:
-                break
-            if nxt == P1 and curr == P0:
-                break
+            if nxt is None: break
+            if nxt == P1 and curr == P0: break
             pts.append(nxt)
             visited[nxt[0], nxt[1]] = True
             prev, curr = curr, nxt
@@ -244,112 +243,80 @@ def detect_contours(img_bin: np.ndarray):
                 if padded[r, c - 1] == 0:
                     contour = trace(r, c)
                     if len(contour) >= 15:
-                        contours.append([(cc-1, cr-1) for cr, cc in contour])
-
+                        contours.append([(cc - 1, cr - 1) for cr, cc in contour])
     return contours
 
-def aabb(points: list):
-    xs = [p[0] for p in points]
-    ys = [p[1] for p in points]
-    x_min = min(xs)
-    x_max = max(xs)
-    y_min = min(ys)
-    y_max = max(ys)
-    return x_min, y_min, x_max - x_min, y_max - y_min
-
-def rotate_points(points: list, angle_deg: float, cx: float, cy: float):
-    # x' = cos(a) * (x - cx) - sin(a) * (y - cy) + cx
-    # y' = sin(a) * (x - cx) + cos(a) * (y - cy) + cy
+def roteste_puncte(points, angle_deg, cx, cy):
     a = np.radians(angle_deg)
-    cos_a = np.cos(a)
-    sin_a = np.sin(a)
-    rotated = []
-    for x, y in points:
-        dx = x - cx
-        dy = y - cy
-        rx = cos_a * dx - sin_a * dy + cx
-        ry = sin_a * dx + cos_a * dy + cy
-        rotated.append((rx, ry))
-    return rotated
+    c, s = np.cos(a), np.sin(a)
+    return [(c * (x - cx) - s * (y - cy) + cx, s * (x - cx) + c * (y - cy) + cy)
+            for x, y in points]
 
 
-def min_area_rectangle(points: list):
-    """
-    Gaseste dreptunghiul minim de arie care incadreaza un set de puncte.
-      Calculeaza centrul punctelor (centroid)
-      Pentru fiecare unghi de la 0 la 90 grade (pas de 2 grade):
-         Roteste toate punctele cu acel unghi in jurul centroidului
-         Calculeaza AABB (x_min, x_max, y_min, y_max) pe punctele rotite
-         Calculeaza aria = width * height
-      Retine unghiul care a dat aria cea mai mica
-      Calculeaza cele 4 colturi ale AABB la unghiul optim
-      Roteste colturile inapoi (cu -unghi) ca sa obtina pozitia reala
-      (center, (width, height), angle_deg, box_4_points)
-    """
+def min_area_rect_bf(points):
     if len(points) < 3:
-        x_min, y_min, w, h = aabb(points)
-        cx = x_min + w / 2
-        cy = y_min + h / 2
-        box = [(x_min, y_min), (x_min + w, y_min),
-               (x_min + w, y_min + h), (x_min, y_min + h)]
-        return (cx, cy), (w, h), 0.0, box
+        xs = [p[0] for p in points];
+        ys = [p[1] for p in points]
+        x0, y0 = min(xs), min(ys)
+        w, h = max(xs) - x0, max(ys) - y0
+        return (x0 + w / 2, y0 + h / 2), (max(w, 1), max(h, 1)), 0.0, \
+            [(x0, y0), (x0 + w, y0), (x0 + w, y0 + h), (x0, y0 + h)]
 
-    # centroid
     cx = sum(p[0] for p in points) / len(points)
     cy = sum(p[1] for p in points) / len(points)
+    best_angle, best_area, best_bbox = 0, float('inf'), None
 
-    best_angle = 0
-    best_area = float('inf')
-    best_bbox = None
-
-    # incearca fiecare unghi de la 0 la 90 grade, pas de 2
     for angle in range(0, 91, 2):
-        rotated = rotate_points(points, angle, cx, cy)
-
-        # AABB pe punctele rotite
-        xs = [p[0] for p in rotated]
-        ys = [p[1] for p in rotated]
-        x_min = min(xs)
-        x_max = max(xs)
-        y_min = min(ys)
-        y_max = max(ys)
-
-        w = x_max - x_min
-        h = y_max - y_min
-        area = w * h
-
+        rot = roteste_puncte(points, angle, cx, cy)
+        xs = [p[0] for p in rot];
+        ys = [p[1] for p in rot]
+        xn, xx, yn, yx = min(xs), max(xs), min(ys), max(ys)
+        area = (xx - xn) * (yx - yn)
         if area < best_area:
-            best_area = area
+            best_area = area;
             best_angle = angle
-            best_bbox = (x_min, y_min, x_max, y_max)
+            best_bbox = (xn, yn, xx, yx)
 
-    # acum avem unghiul optim — calculam colturile AABB in spatiul rotit
-    x_min, y_min, x_max, y_max = best_bbox
-    w = x_max - x_min
-    h = y_max - y_min
-
-    # cele 4 colturi ale AABB (in spatiul rotit)
-    corners_rotated = [
-        (x_min, y_min),  # top-left
-        (x_max, y_min),  # top-right
-        (x_max, y_max),  # bottom-right
-        (x_min, y_max),  # bottom-left
-    ]
-
-    # roteste colturile inapoi cu -best_angle ca sa obtinem pozitia reala
-    corners_real = rotate_points(corners_rotated, -best_angle, cx, cy)
-
-    # centrul dreptunghiului
-    center_rotated = ((x_min + x_max) / 2, (y_min + y_max) / 2)
-    center_real = rotate_points([center_rotated], -best_angle, cx, cy)[0]
-
-    return center_real, (w, h), float(best_angle), corners_real
+    xn, yn, xx, yx = best_bbox
+    w, h = xx - xn, yx - yn
+    corners = roteste_puncte([(xn, yn), (xx, yn), (xx, yx), (xn, yx)], -best_angle, cx, cy)
+    center = roteste_puncte([((xn + xx) / 2, (yn + yx) / 2)], -best_angle, cx, cy)[0]
+    return center, (max(w, 1), max(h, 1)), float(best_angle), corners
 
 
-def filtreaza_placute(contours: list, img_shape: tuple):
-    # pentru fiecare contur: calculeaza minAreaRect (AABB + brute force rotation)
-    # apoi filtreaza dupa aspect ratio, arie, soliditate
-    # sorteaza dupa scor
+def get_roi_bbox(box, img_shape):
+    xs = [int(p[0]) for p in box]
+    ys = [int(p[1]) for p in box]
+    y0 = max(0, min(ys))
+    y1 = min(img_shape[0] - 1, max(ys))
+    x0 = max(0, min(xs))
+    x1 = min(img_shape[1] - 1, max(xs))
+    return y0, y1, x0, x1
+
+
+def densitate_muchii(edges, box):
+    y0, y1, x0, x1 = get_roi_bbox(box, edges.shape)
+    if y1 <= y0 or x1 <= x0: return 0.0
+    roi = edges[y0:y1 + 1, x0:x1 + 1]
+    total = roi.shape[0] * roi.shape[1]
+    return np.count_nonzero(roi) / total if total > 0 else 0.0
+
+
+def contrast_grayscale(gray, box):
+    y0, y1, x0, x1 = get_roi_bbox(box, gray.shape)
+    if y1 <= y0 or x1 <= x0: return 0.0
+    roi = gray[y0:y1 + 1, x0:x1 + 1].astype(np.float64)
+    return np.std(roi)
+
+
+def luminozitate_medie(gray, box):
+    y0, y1, x0, x1 = get_roi_bbox(box, gray.shape)
+    if y1 <= y0 or x1 <= x0: return 0.0
+    roi = gray[y0:y1 + 1, x0:x1 + 1].astype(np.float64)
+    return np.mean(roi)
+
+
+def filtreaza_placute(contours, img_shape, edges, gray):
     img_h, img_w = img_shape[:2]
     img_area = img_h * img_w
     candidati = []
@@ -358,48 +325,48 @@ def filtreaza_placute(contours: list, img_shape: tuple):
         if len(contour) < 15:
             continue
 
-        rect = min_area_rectangle(contour)
-        if rect is None:
-            continue
+        rect = min_area_rect_bf(contour)
+        if rect is None: continue
 
         center, (w, h), angle, box = rect
-
-        if h > w:
-            w, h = h, w
-
-        if h < 15 or w < 40 or h > 150:
-            continue
+        if h > w: w, h = h, w
+        if h < 10 or w < 30 or h > 200: continue
 
         aspect_ratio = w / h
         area = w * h
         area_ratio = area / img_area
 
-        if not (2.5 <= aspect_ratio <= 5.5 and 0.002 <= area_ratio <= 0.05):
+        if not (2.5 <= aspect_ratio <= 5.5 and 0.001 <= area_ratio <= 0.06):
             continue
 
-        # soliditate = aria conturului (Shoelace) / aria dreptunghiului
-        n = len(contour)
-        contour_area = 0.0
-        for ci in range(n):
-            cj = (ci + 1) % n
-            contour_area += contour[ci][0] * contour[cj][1]
-            contour_area -= contour[cj][0] * contour[ci][1]
-        contour_area = abs(contour_area) / 2.0
-        soliditate = contour_area / max(area, 1)
+        density = densitate_muchii(edges, box)
+        contrast = contrast_grayscale(gray, box)
+        brightness = luminozitate_medie(gray, box)
 
-        if soliditate < 0.3:
-            continue
+        ar_score = max(0, 1.0 - abs(aspect_ratio - 4.7) / 4.7)
 
-        ar_score = 1.0 - abs(aspect_ratio - 4.7) / 4.7
-        solid_score = soliditate
+        if density < 0.03:
+            dens_score = 0.0
+        elif density <= 0.35:
+            dens_score = 1.0
+        else:
+            dens_score = max(0, 1.0 - (density - 0.35) / 0.30)
+
+        contrast_score = min(1.0, contrast / 60.0)
+
+        bright_score = min(1.0, max(0, (brightness - 80) / 120.0))
+
         _, cy_pos = center
-        pos_score = cy_pos / img_shape[0]
-        ar_area_score = 1.0 - abs(area_ratio - 0.01) / 0.05
+        pos_score = cy_pos / img_h
 
-        score = (ar_score * 3.0 +
-                 solid_score * 2.0 +
-                 pos_score * 1.5 +
-                 ar_area_score * 1.0)
+        area_score = max(0, 1.0 - abs(area_ratio - 0.008) / 0.05)
+
+        score = (ar_score * 2.5 +
+                 dens_score * 2.0 +
+                 contrast_score * 3.0 +  # contrastul e cel mai influent
+                 bright_score * 2.0 +  # luminozitatea separa placuta de grila
+                 pos_score * 1.0 +
+                 area_score * 0.5)
 
         candidati.append({
             "contour": contour,
@@ -410,14 +377,16 @@ def filtreaza_placute(contours: list, img_shape: tuple):
             "area": area,
             "aspect_ratio": aspect_ratio,
             "area_ratio": area_ratio,
-            "soliditate": soliditate,
+            "density": density,
+            "contrast": contrast,
+            "brightness": brightness,
             "score": score,
         })
 
     candidati.sort(key=lambda c: c["score"], reverse=True)
     return candidati
 
-def sort_4_points(pts):
+def ordoneaza_4_puncte(pts):
     arr = np.array(pts, dtype=np.float32)
     s = arr.sum(axis=1)
     d = np.diff(arr, axis=1).flatten()
@@ -429,123 +398,99 @@ def sort_4_points(pts):
     return o
 
 
-def decupeaza_placuta(image: np.ndarray, box):
-    src = sort_4_points(box)
+def decupeaza_placuta(image, box):
+    src = ordoneaza_4_puncte(box)
     w = int(max(np.linalg.norm(src[1] - src[0]), np.linalg.norm(src[2] - src[3])))
     h = int(max(np.linalg.norm(src[3] - src[0]), np.linalg.norm(src[2] - src[1])))
-    if w < 30 or h < 10:
-        return None
-    dst = np.array([[0,0],[w-1,0],[w-1,h-1],[0,h-1]], dtype=np.float32)
+    if w < 30 or h < 10: return None
+    dst = np.array([[0, 0], [w - 1, 0], [w - 1, h - 1], [0, h - 1]], dtype=np.float32)
     M = cv2.getPerspectiveTransform(src, dst)
     return cv2.warpPerspective(image, M, (w, h))
 
 
+def detect_plate(image):
+    print("DETECTIE PLACUTA DE INMATRICULARE")
 
-def detect_plate(image: np.ndarray):
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    max_w = 800
+    scale = 1.0
+    if image.shape[1] > max_w:
+        scale = max_w / image.shape[1]
+        work = cv2.resize(image, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+    else:
+        work = image.copy()
 
-    print("Canny")
+    print(f"{image.shape[1]}x{image.shape[0]} -> {work.shape[1]}x{work.shape[0]}")
+    gray = cv2.cvtColor(work, cv2.COLOR_BGR2GRAY)
+
+    print("Canny...")
     edges = canny(gray, gauss_w=5, p=0.1, k=0.4)
-    cv2.imshow("Canny", edges)
+    cv2.imshow("1. Canny", edges)
 
-    print("Dilation + closing")
-    elem_dilat = np.ones((1, 9), dtype=np.uint8)
-    dilated = dilation(edges, elem_dilat)
-    elem_close = np.ones((3, 11), dtype=np.uint8)
-    morphed = closing(dilated, elem_close)
-    cv2.imshow("Dilation + closing", morphed)
+    print("Closing 3x3")
+    elem = np.ones((3, 3), dtype=np.uint8)
+    closed = closing(edges, elem)
+    cv2.imshow("2. Closing 3x3", closed)
 
     print("Detecting contours")
-    contours = detect_contours(morphed)
+    contours = find_contours_lab6(closed)
     print(f"Contururi: {len(contours)}")
 
-    img_c = image.copy()
-    for contour in contours:
-        pts = np.array(contour, dtype=np.int32).reshape(-1, 1, 2)
+    img_c = work.copy()
+    for c in contours:
+        pts = np.array(c, dtype=np.int32).reshape(-1, 1, 2)
         cv2.polylines(img_c, [pts], True, (0, 255, 0), 1)
-    cv2.imshow("Contururi", img_c)
+    cv2.imshow("3. Contururi", img_c)
 
-    print("Filtrare geometrica")
-    candidati = filtreaza_placute(contours, image.shape)
+    print("Filtrare + scoring")
+    candidati = filtreaza_placute(contours, work.shape, edges, gray)
     print(f"Candidati: {len(candidati)}")
 
     for i, c in enumerate(candidati[:5]):
-        print(f"#{i+1}: SCOR={c['score']:.2f}, AR={c['aspect_ratio']:.2f}, "
-              f"solid={c['soliditate']:.2f}, arie={c['area_ratio']:.4f}, "
-              f"size={c['size'][0]:.0f}x{c['size'][1]:.0f}, unghi={c['angle']:.0f}°")
+        print(f"#{i + 1}: SCOR={c['score']:.2f}, AR={c['aspect_ratio']:.2f}, "
+              f"dens={c['density']:.2f}, contrast={c['contrast']:.0f}, "
+              f"bright={c['brightness']:.0f}, size={c['size'][0]:.0f}x{c['size'][1]:.0f}")
 
-    img_cand = image.copy()
+    img_cand = work.copy()
     for i, c in enumerate(candidati[:5]):
         box_np = np.array(c["box"], dtype=np.int32)
         color = (0, 255, 0) if i == 0 else (0, 255, 255)
         cv2.polylines(img_cand, [box_np], True, color, 2)
         cx, cy = int(c["center"][0]), int(c["center"][1])
-        cv2.putText(img_cand, f"#{i+1} AR={c['aspect_ratio']:.1f}",
-                    (cx - 30, cy - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
-    cv2.imshow("Candidati", img_cand)
+        cv2.putText(img_cand, f"#{i + 1} s={c['score']:.1f}",
+                    (cx - 30, cy - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
+    cv2.imshow("4. Candidati", img_cand)
 
     if not candidati:
-        print("Niciun candidat gasit")
-        cv2.waitKey(0)
+        print("Niciun candidat!")
+        cv2.waitKey(0);
         cv2.destroyAllWindows()
         return
 
     best = candidati[0]
     print(f"Best: SCOR={best['score']:.2f}, AR={best['aspect_ratio']:.2f}, "
-          f"unghi={best['angle']:.0f}°")
+          f"contrast={best['contrast']:.0f}, bright={best['brightness']:.0f}")
 
-    plate = decupeaza_placuta(image, best["box"])
+    box_orig = [(x / scale, y / scale) for x, y in best["box"]]
+    plate = decupeaza_placuta(image, box_orig)
     if plate is not None:
-        cv2.imshow("Placuta decupata", plate)
+        cv2.imshow("5. Placuta decupata", plate)
         img_final = image.copy()
-        box_np = np.array(best["box"], dtype=np.int32)
-        cv2.polylines(img_final, [box_np], True, (0, 255, 0), 2)
-        readNumberFromPlate(plate)
-        cv2.imshow("Rezultat", img_final)
+        box_np = np.array(box_orig, dtype=np.int32)
+        cv2.polylines(img_final, [box_np], True, (0, 255, 0), 3)
+        cv2.imshow("6. Rezultat", img_final)
     else:
-        print("Placuta de inmatriculare n-a putut fi detectata")
+        print("Prea mica.")
 
-    cv2.waitKey(0)
+    cv2.waitKey(0);
     cv2.destroyAllWindows()
-
-def readNumberFromPlate(image: np.ndarray):
-    plate_gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-
-    # Resize — Tesseract works best when characters are ~30px tall
-    scale = max(1, 60 // plate_gray.shape[0])
-    plate_resized = cv2.resize(
-        plate_gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC
-    )
-
-    # Binarize with Otsu's threshold
-    _, plate_bin = cv2.threshold(
-        plate_resized, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
-    )
-
-    cv2.imshow("Plate for OCR", plate_bin)
-
-    # 3. Run Tesseract
-    # PSM 7 = single line of text; PSM 8 = single word
-    config = r"--psm 7 --oem 3 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-    pil_img = Image.fromarray(plate_bin)
-    text = pytesseract.image_to_string(pil_img, config=config).strip()
-
-    print(f"Detected plate number: {text}")
-
-    # 4. Overlay the result on the image
-    cv2.putText(
-        image, text,
-        (30, 50),
-        cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 0, 255), 3)
 
 
 def main():
-    image_path = select_image()
-    if image_path is None:
-        print("No image selected.")
+    path = select_image()
+    if not path:
+        print("No image.");
         sys.exit(0)
-    image = load_image(image_path)
-    detect_plate(image)
+    detect_plate(load_image(path))
 
 
 if __name__ == "__main__":
