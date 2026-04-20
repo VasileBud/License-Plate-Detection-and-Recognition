@@ -1,10 +1,11 @@
 import sys
 from collections import deque
-
 import cv2
 from tkinter import Tk, filedialog
-
 import numpy as np
+import pytesseract
+pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+from PIL import Image
 
 
 def select_image():
@@ -496,16 +497,47 @@ def detect_plate(image: np.ndarray):
     plate = decupeaza_placuta(image, best["box"])
     if plate is not None:
         cv2.imshow("Placuta decupata", plate)
-
         img_final = image.copy()
         box_np = np.array(best["box"], dtype=np.int32)
         cv2.polylines(img_final, [box_np], True, (0, 255, 0), 2)
+        readNumberFromPlate(plate)
         cv2.imshow("Rezultat", img_final)
     else:
         print("Placuta de inmatriculare n-a putut fi detectata")
 
     cv2.waitKey(0)
     cv2.destroyAllWindows()
+
+def readNumberFromPlate(image: np.ndarray):
+    plate_gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+
+    # Resize — Tesseract works best when characters are ~30px tall
+    scale = max(1, 60 // plate_gray.shape[0])
+    plate_resized = cv2.resize(
+        plate_gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC
+    )
+
+    # Binarize with Otsu's threshold
+    _, plate_bin = cv2.threshold(
+        plate_resized, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
+    )
+
+    cv2.imshow("Plate for OCR", plate_bin)
+
+    # 3. Run Tesseract
+    # PSM 7 = single line of text; PSM 8 = single word
+    config = r"--psm 7 --oem 3 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+    pil_img = Image.fromarray(plate_bin)
+    text = pytesseract.image_to_string(pil_img, config=config).strip()
+
+    print(f"Detected plate number: {text}")
+
+    # 4. Overlay the result on the image
+    cv2.putText(
+        image, text,
+        (30, 50),
+        cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 0, 255), 3)
+
 
 def main():
     image_path = select_image()
