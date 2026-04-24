@@ -131,7 +131,7 @@ def main() -> None:
     element = np.ones((closing_kernel, closing_kernel), dtype=np.uint8)
     closed = closing(edges, element)
     contours = find_contours(closed, min_contour_len)
-    candidates = filter_plate_candidates(contours, image.shape, edges, gray)
+    candidates = filter_plate_candidates(image ,contours, edges, gray)
 
     best_candidate = candidates[0] if candidates else None
     best_box_original = None

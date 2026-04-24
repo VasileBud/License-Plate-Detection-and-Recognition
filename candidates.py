@@ -24,6 +24,16 @@ CONTRAST_NORMALIZATION = 60.0
 MIN_BRIGHTNESS = 80.0
 BRIGHTNESS_RANGE = 120.0
 
+WHITE_HSV_LOW = (0, 0, 140)
+WHITE_HSV_HIGH = (180, 80, 255)
+MIN_WHITE_RATIO = 0.30
+TARGET_WHITE_RATIO = 0.60
+
+# Gaussian prior on vertical position: plates are usually in the lower half of
+# the frame (dash-cam / front-of-car shots). Center at 0.72 with sigma 0.18.
+POSITION_CENTER_Y = 0.72
+POSITION_SIGMA = 0.18
+
 WEIGHT_ASPECT_RATIO = 2.5
 WEIGHT_DENSITY = 2.0
 WEIGHT_CONTRAST = 3.0
@@ -31,6 +41,7 @@ WEIGHT_BRIGHTNESS = 2.0
 WEIGHT_POSITION = 1.0
 WEIGHT_AREA = 0.5
 WEIGHT_TEXT = 2.5
+WEIGHT_WHITE = 2.0
 
 MIN_CHAR_HEIGHT_RATIO = 0.30
 MAX_CHAR_HEIGHT_RATIO = 0.95
@@ -100,11 +111,18 @@ def has_horizontal_span(box) -> bool:
     return span_x >= span_y
 
 
+def compute_white_mask(bgr_image):
+    hsv = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2HSV)
+    low = np.array(WHITE_HSV_LOW, dtype=np.uint8)
+    high = np.array(WHITE_HSV_HIGH, dtype=np.uint8)
+    return cv2.inRange(hsv, low, high)
+
+
 def label_components_bfs(binary_image):
     rows, cols = binary_image.shape
     labels = np.zeros((rows, cols), dtype=np.int32)
     neighbors = [(-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1)]
-    stats: dict[int, tuple[int, int, int]] = {}
+    components: list[tuple[int, int, int, int, int]] = []
     current_label = 0
 
     for i in range(rows):
@@ -133,8 +151,8 @@ def label_components_bfs(binary_image):
                                 and binary_image[next_i, next_j] == 255 and labels[next_i, next_j] == 0:
                             labels[next_i, next_j] = current_label
                             queue.append((next_i, next_j))
-                stats[current_label] = (max_i - min_i + 1, max_j - min_j + 1, count)
-    return stats
+                components.append((min_i, min_j, max_i, max_j, count))
+    return components
 
 
 def count_characters_roi(gray_roi) -> int:
@@ -145,15 +163,41 @@ def count_characters_roi(gray_roi) -> int:
     mean = gray_roi.mean()
     binary_image = np.where(gray_roi < mean, 255, 0).astype(np.uint8)
 
-    stats = label_components_bfs(binary_image)
+    components = label_components_bfs(binary_image)
 
     min_height = MIN_CHAR_HEIGHT_RATIO * roi_height
     max_height = MAX_CHAR_HEIGHT_RATIO * roi_height
     count = 0
-    for height, width, area in stats.values():
+    for min_i, min_j, max_i, max_j, area in components:
+        height = max_i - min_i + 1
+        width = max_j - min_j + 1
         if min_height <= height <= max_height and height >= width and area >= 10:
             count += 1
     return count
+
+
+def find_character_boxes(gray_roi,
+                         min_height_ratio: float = MIN_CHAR_HEIGHT_RATIO,
+                         max_height_ratio: float = MAX_CHAR_HEIGHT_RATIO,
+                         min_area: int = 10) -> list[tuple[int, int, int, int]]:
+    roi_height, roi_width = gray_roi.shape
+    if roi_height < 8 or roi_width < 20:
+        return []
+
+    blurred = cv2.GaussianBlur(gray_roi, (3, 3), 0)
+    _, binary = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+
+    components = label_components_bfs(binary)
+    min_h = min_height_ratio * roi_height
+    max_h = max_height_ratio * roi_height
+    boxes: list[tuple[int, int, int, int]] = []
+    for min_i, min_j, max_i, max_j, area in components:
+        height = max_i - min_i + 1
+        width = max_j - min_j + 1
+        if min_h <= height <= max_h and height >= width and area >= min_area:
+            boxes.append((min_j, min_i, width, height))
+    boxes.sort(key=lambda b: b[0])
+    return boxes
 
 
 def score_text(n_chars: int) -> float:
@@ -219,27 +263,41 @@ def min_area_rect_pca(points):
     )
 
 
-def filter_plate_candidates(contours, img_shape, edges, gray):
-    img_height, img_width = img_shape[:2]
+def filter_plate_candidates(img, contours, edges, gray, debug=False):
+    img_height, img_width = img.shape[:2]
     img_area = img_height * img_width
-    min_contour_len = contour_length_threshold(img_shape)
-    min_height, min_width, max_height = plate_size_thresholds(img_shape)
+    min_contour_len = contour_length_threshold(img.shape)
+    min_height, min_width, max_height = plate_size_thresholds(img.shape)
     candidates = []
+    rejections = {
+        "short_contour": 0,
+        "no_rect": 0,
+        "not_horizontal": 0,
+        "size": 0,
+        "aspect_or_area": 0,
+        "warp_failed": 0,
+        "white_mask": 0,
+        "n_chars": 0,
+    }
 
     for contour in contours:
         if len(contour) < min_contour_len:
+            rejections["short_contour"] += 1
             continue
 
         rect = min_area_rect_pca(contour)
         if rect is None:
+            rejections["no_rect"] += 1
             continue
 
         center, (width, height), angle, box = rect
         if REQUIRE_HORIZONTAL_SPAN and not has_horizontal_span(box):
+            rejections["not_horizontal"] += 1
             continue
         if height > width:
             width, height = height, width
         if height < min_height or width < min_width or height > max_height:
+            rejections["size"] += 1
             continue
 
         aspect_ratio = width / height
@@ -248,12 +306,28 @@ def filter_plate_candidates(contours, img_shape, edges, gray):
 
         if not (MIN_ASPECT_RATIO <= aspect_ratio <= MAX_ASPECT_RATIO
                 and MIN_AREA_RATIO <= area_ratio <= MAX_AREA_RATIO):
+            rejections["aspect_or_area"] += 1
             continue
 
         gray_roi = warp_roi(gray, box)
         edges_roi = warp_roi(edges, box)
         if gray_roi is None or edges_roi is None:
+            rejections["warp_failed"] += 1
             continue
+
+        white_mask = compute_white_mask(img)
+
+        if white_mask is not None:
+            white_roi = warp_roi(white_mask, box)
+            if white_roi is None or white_roi.size == 0:
+                rejections["warp_failed"] += 1
+                continue
+            white_ratio = float(np.count_nonzero(white_roi)) / white_roi.size
+            if white_ratio < MIN_WHITE_RATIO:
+                rejections["white_mask"] += 1
+                continue
+        else:
+            white_ratio = 0.0
 
         density = edge_density_roi(edges_roi)
         contrast = contrast_roi(gray_roi)
@@ -262,6 +336,7 @@ def filter_plate_candidates(contours, img_shape, edges, gray):
 
         # Reject regions that clearly do not look like text.
         if n_chars < MIN_ABSOLUTE_CHARS or n_chars > MAX_ABSOLUTE_CHARS:
+            rejections["n_chars"] += 1
             continue
 
         ar_score = max(0, 1.0 - abs(aspect_ratio - TARGET_ASPECT_RATIO) / TARGET_ASPECT_RATIO)
@@ -277,10 +352,12 @@ def filter_plate_candidates(contours, img_shape, edges, gray):
         bright_score = min(1.0, max(0, (brightness - MIN_BRIGHTNESS) / BRIGHTNESS_RANGE))
 
         _, center_y = center
-        pos_score = center_y / img_height
+        normalized_y = center_y / img_height
+        pos_score = float(np.exp(-0.5 * ((normalized_y - POSITION_CENTER_Y) / POSITION_SIGMA) ** 2))
 
         area_score = max(0, 1.0 - abs(area_ratio - TARGET_AREA_RATIO) / AREA_RATIO_TOLERANCE)
         text_score = score_text(n_chars)
+        white_score = min(1.0, white_ratio / TARGET_WHITE_RATIO) if TARGET_WHITE_RATIO > 0 else 0.0
 
         score = (ar_score * WEIGHT_ASPECT_RATIO
                  + dens_score * WEIGHT_DENSITY
@@ -288,7 +365,8 @@ def filter_plate_candidates(contours, img_shape, edges, gray):
                  + bright_score * WEIGHT_BRIGHTNESS
                  + pos_score * WEIGHT_POSITION
                  + area_score * WEIGHT_AREA
-                 + text_score * WEIGHT_TEXT)
+                 + text_score * WEIGHT_TEXT
+                 + white_score * WEIGHT_WHITE)
 
         candidates.append({
             "contour": contour,
@@ -303,8 +381,11 @@ def filter_plate_candidates(contours, img_shape, edges, gray):
             "contrast": contrast,
             "brightness": brightness,
             "n_chars": n_chars,
+            "white_ratio": white_ratio,
             "score": score,
         })
 
     candidates.sort(key=lambda candidate: candidate["score"], reverse=True)
+    if debug:
+        print(f"[filter] accepted={len(candidates)}, rejected={rejections}")
     return candidates
