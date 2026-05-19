@@ -29,8 +29,6 @@ WHITE_HSV_HIGH = (180, 80, 255)
 MIN_WHITE_RATIO = 0.30
 TARGET_WHITE_RATIO = 0.60
 
-# Gaussian prior on vertical position: plates are usually in the lower half of
-# the frame (dash-cam / front-of-car shots). Center at 0.72 with sigma 0.18.
 POSITION_CENTER_Y = 0.72
 POSITION_SIGMA = 0.18
 
@@ -52,150 +50,119 @@ MAX_ABSOLUTE_CHARS = 14
 
 
 def contour_length_threshold(img_shape) -> int:
-    img_height, img_width = img_shape[:2]
-    min_dim = min(img_height, img_width)
+    min_dim = min(img_shape[0], img_shape[1])
     return max(15, int(round(min_dim * MIN_CONTOUR_LENGTH_RATIO)))
 
 
-def plate_size_thresholds(img_shape) -> tuple[float, float, float]:
-    img_height, img_width = img_shape[:2]
-    min_height = max(10.0, img_height * MIN_HEIGHT_RATIO)
-    min_width = max(30.0, img_width * MIN_WIDTH_RATIO)
-    max_height = max(min_height, img_height * MAX_HEIGHT_RATIO)
-    return min_height, min_width, max_height
+def plate_size_thresholds(img_shape):
+    h, w = img_shape[:2]
+    min_h = max(10.0, h * MIN_HEIGHT_RATIO)
+    min_w = max(30.0, w * MIN_WIDTH_RATIO)
+    max_h = max(min_h, h * MAX_HEIGHT_RATIO)
+    return min_h, min_w, max_h
 
 
 def order_4_points(points):
-    points_array = np.asarray(points, dtype=np.float32)
-    sums = points_array.sum(axis=1)
-    diffs = np.diff(points_array, axis=1).flatten()
-    ordered = np.zeros((4, 2), dtype=np.float32)
-    ordered[0] = points_array[np.argmin(sums)]  # top-left: minimum x+y
-    ordered[1] = points_array[np.argmin(diffs)]  # top-right: minimum y-x
-    ordered[2] = points_array[np.argmax(sums)]  # bottom-right: maximum x+y
-    ordered[3] = points_array[np.argmax(diffs)]  # bottom-left: maximum y-x
-    return ordered
+    pts = np.asarray(points, dtype=np.float32)
+    sums = pts.sum(axis=1)
+    diffs = np.diff(pts, axis=1).flatten()
+    return np.array([
+        pts[np.argmin(sums)],   # top-left
+        pts[np.argmin(diffs)],  # top-right
+        pts[np.argmax(sums)],   # bottom-right
+        pts[np.argmax(diffs)],  # bottom-left
+    ], dtype=np.float32)
 
 
 def warp_roi(src, box):
-    points = order_4_points(box)
-    width = int(max(np.linalg.norm(points[1] - points[0]), np.linalg.norm(points[2] - points[3])))
-    height = int(max(np.linalg.norm(points[3] - points[0]), np.linalg.norm(points[2] - points[1])))
-    if width < 10 or height < 5:
+    pts = order_4_points(box)
+    w = int(max(np.linalg.norm(pts[1] - pts[0]), np.linalg.norm(pts[2] - pts[3])))
+    h = int(max(np.linalg.norm(pts[3] - pts[0]), np.linalg.norm(pts[2] - pts[1])))
+    if w < 10 or h < 5:
         return None
-    destination = np.array(
-        [[0, 0], [width - 1, 0], [width - 1, height - 1], [0, height - 1]],
-        dtype=np.float32,
-    )
-    transform = cv2.getPerspectiveTransform(points, destination)
-    return cv2.warpPerspective(src, transform, (width, height))
-
-
-def edge_density_roi(edges_roi):
-    total = edges_roi.size
-    return np.count_nonzero(edges_roi) / total if total > 0 else 0.0
-
-
-def contrast_roi(gray_roi):
-    return float(np.std(gray_roi.astype(np.float64)))
-
-
-def brightness_roi(gray_roi):
-    return float(np.mean(gray_roi.astype(np.float64)))
+    dst = np.array([[0, 0], [w - 1, 0], [w - 1, h - 1], [0, h - 1]], dtype=np.float32)
+    return cv2.warpPerspective(src, cv2.getPerspectiveTransform(pts, dst), (w, h))
 
 
 def has_horizontal_span(box) -> bool:
-    points = np.asarray(box, dtype=np.float64)
-    span_x = float(points[:, 0].max() - points[:, 0].min())
-    span_y = float(points[:, 1].max() - points[:, 1].min())
-    return span_x >= span_y
+    pts = np.asarray(box, dtype=np.float64)
+    sx = pts[:, 0].max() - pts[:, 0].min()
+    sy = pts[:, 1].max() - pts[:, 1].min()
+    return sx >= sy
 
 
 def compute_white_mask(bgr_image):
     hsv = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2HSV)
-    low = np.array(WHITE_HSV_LOW, dtype=np.uint8)
-    high = np.array(WHITE_HSV_HIGH, dtype=np.uint8)
-    return cv2.inRange(hsv, low, high)
+    return cv2.inRange(hsv, np.array(WHITE_HSV_LOW, np.uint8), np.array(WHITE_HSV_HIGH, np.uint8))
 
 
 def label_components_bfs(binary_image):
     rows, cols = binary_image.shape
     labels = np.zeros((rows, cols), dtype=np.int32)
-    neighbors = [(-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1)]
-    components: list[tuple[int, int, int, int, int]] = []
-    current_label = 0
+    di = [-1, -1, -1, 0, 0, 1, 1, 1]
+    dj = [-1, 0, 1, -1, 1, -1, 0, 1]
+    components = []
+    label = 0
 
     for i in range(rows):
         for j in range(cols):
             if binary_image[i, j] == 255 and labels[i, j] == 0:
-                current_label += 1
-                labels[i, j] = current_label
-                queue = deque([(i, j)])
-                min_i = max_i = i
-                min_j = max_j = j
+                label += 1
+                labels[i, j] = label
+                Q = deque()
+                Q.append((i, j))
+                min_i = i
+                max_i = i
+                min_j = j
+                max_j = j
                 count = 0
-                while queue:
-                    current_i, current_j = queue.popleft()
+                while Q:
+                    q = Q.popleft()
+                    qi = q[0]
+                    qj = q[1]
                     count += 1
-                    if current_i < min_i:
-                        min_i = current_i
-                    if current_i > max_i:
-                        max_i = current_i
-                    if current_j < min_j:
-                        min_j = current_j
-                    if current_j > max_j:
-                        max_j = current_j
-                    for delta_i, delta_j in neighbors:
-                        next_i, next_j = current_i + delta_i, current_j + delta_j
-                        if 0 <= next_i < rows and 0 <= next_j < cols \
-                                and binary_image[next_i, next_j] == 255 and labels[next_i, next_j] == 0:
-                            labels[next_i, next_j] = current_label
-                            queue.append((next_i, next_j))
+                    if qi < min_i: min_i = qi
+                    if qi > max_i: max_i = qi
+                    if qj < min_j: min_j = qj
+                    if qj > max_j: max_j = qj
+                    for k in range(8):
+                        ni = qi + di[k]
+                        nj = qj + dj[k]
+                        if 0 <= ni < rows and 0 <= nj < cols:
+                            if binary_image[ni, nj] == 255 and labels[ni, nj] == 0:
+                                labels[ni, nj] = label
+                                Q.append((ni, nj))
                 components.append((min_i, min_j, max_i, max_j, count))
     return components
 
 
+def _char_boxes_from_binary(binary, roi_height, min_area=10):
+    min_h = MIN_CHAR_HEIGHT_RATIO * roi_height
+    max_h = MAX_CHAR_HEIGHT_RATIO * roi_height
+    boxes = []
+    for min_i, min_j, max_i, max_j, area in label_components_bfs(binary):
+        h = max_i - min_i + 1
+        w = max_j - min_j + 1
+        if min_h <= h <= max_h and h >= w and area >= min_area:
+            boxes.append((min_j, min_i, w, h))
+    return boxes
+
+
 def count_characters_roi(gray_roi) -> int:
-    roi_height, roi_width = gray_roi.shape
-    if roi_height < 8 or roi_width < 20:
+    h, w = gray_roi.shape
+    if h < 8 or w < 20:
         return 0
-
-    mean = gray_roi.mean()
-    binary_image = np.where(gray_roi < mean, 255, 0).astype(np.uint8)
-
-    components = label_components_bfs(binary_image)
-
-    min_height = MIN_CHAR_HEIGHT_RATIO * roi_height
-    max_height = MAX_CHAR_HEIGHT_RATIO * roi_height
-    count = 0
-    for min_i, min_j, max_i, max_j, area in components:
-        height = max_i - min_i + 1
-        width = max_j - min_j + 1
-        if min_height <= height <= max_height and height >= width and area >= 10:
-            count += 1
-    return count
+    binary = np.where(gray_roi < gray_roi.mean(), 255, 0).astype(np.uint8)
+    return len(_char_boxes_from_binary(binary, h))
 
 
-def find_character_boxes(gray_roi,
-                         min_height_ratio: float = MIN_CHAR_HEIGHT_RATIO,
-                         max_height_ratio: float = MAX_CHAR_HEIGHT_RATIO,
-                         min_area: int = 10) -> list[tuple[int, int, int, int]]:
-    roi_height, roi_width = gray_roi.shape
-    if roi_height < 8 or roi_width < 20:
+def find_character_boxes(gray_roi, min_area: int = 10):
+    h, w = gray_roi.shape
+    if h < 8 or w < 20:
         return []
-
     blurred = cv2.GaussianBlur(gray_roi, (3, 3), 0)
     _, binary = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-
-    components = label_components_bfs(binary)
-    min_h = min_height_ratio * roi_height
-    max_h = max_height_ratio * roi_height
-    boxes: list[tuple[int, int, int, int]] = []
-    for min_i, min_j, max_i, max_j, area in components:
-        height = max_i - min_i + 1
-        width = max_j - min_j + 1
-        if min_h <= height <= max_h and height >= width and area >= min_area:
-            boxes.append((min_j, min_i, width, height))
+    boxes = _char_boxes_from_binary(binary, h, min_area)
     boxes.sort(key=lambda b: b[0])
     return boxes
 
@@ -213,179 +180,152 @@ def score_text(n_chars: int) -> float:
 
 
 def min_area_rect_pca(points):
-    n = len(points)
-    if n < 3:
-        xs = [point[0] for point in points]
-        ys = [point[1] for point in points]
-        x0, y0 = min(xs), min(ys)
-        width, height = max(xs) - x0, max(ys) - y0
-        return (
-            (x0 + width / 2, y0 + height / 2),
-            (max(width, 1), max(height, 1)),
-            0.0,
-            [(x0, y0), (x0 + width, y0), (x0 + width, y0 + height), (x0, y0 + height)],
-        )
+    pts = np.asarray(points, dtype=np.float64)
+    if len(pts) < 3:
+        x0, y0 = pts.min(axis=0)
+        x1, y1 = pts.max(axis=0)
+        w, h = max(x1 - x0, 1), max(y1 - y0, 1)
+        corners = [(x0, y0), (x0 + w, y0), (x0 + w, y0 + h), (x0, y0 + h)]
+        return ((x0 + w / 2, y0 + h / 2), (w, h), 0.0, corners)
 
-    points_array = np.asarray(points, dtype=np.float64)
-    centroid = points_array.mean(axis=0)
-    centered = points_array - centroid
+    centroid = pts.mean(axis=0)
+    centered = pts - centroid
+    cov = (centered.T @ centered) / len(pts)
+    _, eigvecs = np.linalg.eigh(cov)
+    angle = float(np.arctan2(eigvecs[1, -1], eigvecs[0, -1]))
 
-    cxx = np.mean(centered[:, 0] ** 2)
-    cyy = np.mean(centered[:, 1] ** 2)
-    cxy = np.mean(centered[:, 0] * centered[:, 1])
-    covariance = np.array([[cxx, cxy], [cxy, cyy]])
+    cos_a, sin_a = np.cos(-angle), np.sin(-angle)
+    rot = np.array([[cos_a, -sin_a], [sin_a, cos_a]])
+    aligned = centered @ rot.T
+    min_xy = aligned.min(axis=0)
+    max_xy = aligned.max(axis=0)
+    w = float(max(max_xy[0] - min_xy[0], 1))
+    h = float(max(max_xy[1] - min_xy[1], 1))
 
-    _, eigenvectors = np.linalg.eigh(covariance)
-    major_axis = eigenvectors[:, -1]
-    angle_rad = np.arctan2(major_axis[1], major_axis[0])
+    rot_back = rot.T
+    local = np.array([[min_xy[0], min_xy[1]], [max_xy[0], min_xy[1]],
+                      [max_xy[0], max_xy[1]], [min_xy[0], max_xy[1]]])
+    corners = local @ rot_back.T + centroid
+    center = (min_xy + max_xy) / 2 @ rot_back.T + centroid
 
-    cosine, sine = np.cos(-angle_rad), np.sin(-angle_rad)
-    rotation_to_axis = np.array([[cosine, -sine], [sine, cosine]])
-    aligned = centered @ rotation_to_axis.T
-
-    min_x, min_y = aligned.min(axis=0)
-    max_x, max_y = aligned.max(axis=0)
-    width, height = max_x - min_x, max_y - min_y
-
-    cosine, sine = np.cos(angle_rad), np.sin(angle_rad)
-    rotation_back = np.array([[cosine, -sine], [sine, cosine]])
-    corners_local = np.array([[min_x, min_y], [max_x, min_y], [max_x, max_y], [min_x, max_y]])
-    corners = corners_local @ rotation_back.T + centroid
-    center_local = np.array([(min_x + max_x) / 2, (min_y + max_y) / 2])
-    center = center_local @ rotation_back.T + centroid
-
-    angle_deg = float(np.degrees(angle_rad))
     return (
         (float(center[0]), float(center[1])),
-        (float(max(width, 1)), float(max(height, 1))),
-        angle_deg,
+        (w, h),
+        float(np.degrees(angle)),
         [(float(x), float(y)) for x, y in corners],
     )
 
 
+def _score(aspect, density, contrast, brightness, area_ratio, n_chars, white_ratio, center_y, img_h):
+    ar = max(0.0, 1.0 - abs(aspect - TARGET_ASPECT_RATIO) / TARGET_ASPECT_RATIO)
+    if density < MIN_DENSITY:
+        dens = 0.0
+    elif density <= DENSITY_PLATEAU:
+        dens = 1.0
+    else:
+        dens = max(0.0, 1.0 - (density - DENSITY_PLATEAU) / DENSITY_FALLOFF)
+    contr = min(1.0, contrast / CONTRAST_NORMALIZATION)
+    bright = min(1.0, max(0.0, (brightness - MIN_BRIGHTNESS) / BRIGHTNESS_RANGE))
+    pos = float(np.exp(-0.5 * ((center_y / img_h - POSITION_CENTER_Y) / POSITION_SIGMA) ** 2))
+    area = max(0.0, 1.0 - abs(area_ratio - TARGET_AREA_RATIO) / AREA_RATIO_TOLERANCE)
+    text = score_text(n_chars)
+    white = min(1.0, white_ratio / TARGET_WHITE_RATIO) if TARGET_WHITE_RATIO > 0 else 0.0
+    return (ar * WEIGHT_ASPECT_RATIO + dens * WEIGHT_DENSITY + contr * WEIGHT_CONTRAST
+            + bright * WEIGHT_BRIGHTNESS + pos * WEIGHT_POSITION + area * WEIGHT_AREA
+            + text * WEIGHT_TEXT + white * WEIGHT_WHITE)
+
+
 def filter_plate_candidates(img, contours, edges, gray, debug=False):
-    img_height, img_width = img.shape[:2]
-    img_area = img_height * img_width
+    img_h, img_w = img.shape[:2]
+    img_area = img_h * img_w
     min_contour_len = contour_length_threshold(img.shape)
     min_height, min_width, max_height = plate_size_thresholds(img.shape)
+    white_mask = compute_white_mask(img)
     candidates = []
-    rejections = {
-        "short_contour": 0,
-        "no_rect": 0,
-        "not_horizontal": 0,
-        "size": 0,
-        "aspect_or_area": 0,
-        "warp_failed": 0,
-        "white_mask": 0,
-        "n_chars": 0,
-    }
 
     for contour in contours:
         if len(contour) < min_contour_len:
-            rejections["short_contour"] += 1
             continue
-
         rect = min_area_rect_pca(contour)
         if rect is None:
-            rejections["no_rect"] += 1
             continue
-
-        center, (width, height), angle, box = rect
+        center, (w, h), angle, box = rect
         if REQUIRE_HORIZONTAL_SPAN and not has_horizontal_span(box):
-            rejections["not_horizontal"] += 1
             continue
-        if height > width:
-            width, height = height, width
-        if height < min_height or width < min_width or height > max_height:
-            rejections["size"] += 1
+        if h > w:
+            w, h = h, w
+        if h < min_height or w < min_width or h > max_height:
             continue
 
-        aspect_ratio = width / height
-        area = width * height
-        area_ratio = area / img_area
-
-        if not (MIN_ASPECT_RATIO <= aspect_ratio <= MAX_ASPECT_RATIO
-                and MIN_AREA_RATIO <= area_ratio <= MAX_AREA_RATIO):
-            rejections["aspect_or_area"] += 1
+        aspect = w / h
+        area_ratio = (w * h) / img_area
+        if not (MIN_ASPECT_RATIO <= aspect <= MAX_ASPECT_RATIO and MIN_AREA_RATIO <= area_ratio <= MAX_AREA_RATIO):
             continue
 
         gray_roi = warp_roi(gray, box)
         edges_roi = warp_roi(edges, box)
-        if gray_roi is None or edges_roi is None:
-            rejections["warp_failed"] += 1
+        white_roi = warp_roi(white_mask, box)
+        if gray_roi is None or edges_roi is None or white_roi is None or white_roi.size == 0:
             continue
 
-        white_mask = compute_white_mask(img)
+        white_ratio = float(np.count_nonzero(white_roi)) / white_roi.size
+        if white_ratio < MIN_WHITE_RATIO:
+            continue
 
-        if white_mask is not None:
-            white_roi = warp_roi(white_mask, box)
-            if white_roi is None or white_roi.size == 0:
-                rejections["warp_failed"] += 1
-                continue
-            white_ratio = float(np.count_nonzero(white_roi)) / white_roi.size
-            if white_ratio < MIN_WHITE_RATIO:
-                rejections["white_mask"] += 1
-                continue
-        else:
-            white_ratio = 0.0
-
-        density = edge_density_roi(edges_roi)
-        contrast = contrast_roi(gray_roi)
-        brightness = brightness_roi(gray_roi)
+        density = np.count_nonzero(edges_roi) / edges_roi.size if edges_roi.size else 0.0
+        contrast = float(gray_roi.std())
+        brightness = float(gray_roi.mean())
         n_chars = count_characters_roi(gray_roi)
-
-        # Reject regions that clearly do not look like text.
         if n_chars < MIN_ABSOLUTE_CHARS or n_chars > MAX_ABSOLUTE_CHARS:
-            rejections["n_chars"] += 1
             continue
 
-        ar_score = max(0, 1.0 - abs(aspect_ratio - TARGET_ASPECT_RATIO) / TARGET_ASPECT_RATIO)
-
-        if density < MIN_DENSITY:
-            dens_score = 0.0
-        elif density <= DENSITY_PLATEAU:
-            dens_score = 1.0
-        else:
-            dens_score = max(0, 1.0 - (density - DENSITY_PLATEAU) / DENSITY_FALLOFF)
-
-        contrast_score = min(1.0, contrast / CONTRAST_NORMALIZATION)
-        bright_score = min(1.0, max(0, (brightness - MIN_BRIGHTNESS) / BRIGHTNESS_RANGE))
-
-        _, center_y = center
-        normalized_y = center_y / img_height
-        pos_score = float(np.exp(-0.5 * ((normalized_y - POSITION_CENTER_Y) / POSITION_SIGMA) ** 2))
-
-        area_score = max(0, 1.0 - abs(area_ratio - TARGET_AREA_RATIO) / AREA_RATIO_TOLERANCE)
-        text_score = score_text(n_chars)
-        white_score = min(1.0, white_ratio / TARGET_WHITE_RATIO) if TARGET_WHITE_RATIO > 0 else 0.0
-
-        score = (ar_score * WEIGHT_ASPECT_RATIO
-                 + dens_score * WEIGHT_DENSITY
-                 + contrast_score * WEIGHT_CONTRAST
-                 + bright_score * WEIGHT_BRIGHTNESS
-                 + pos_score * WEIGHT_POSITION
-                 + area_score * WEIGHT_AREA
-                 + text_score * WEIGHT_TEXT
-                 + white_score * WEIGHT_WHITE)
-
+        score = _score(aspect, density, contrast, brightness, area_ratio, n_chars, white_ratio, center[1], img_h)
         candidates.append({
-            "contour": contour,
-            "center": center,
-            "size": (width, height),
-            "angle": angle,
-            "box": box,
-            "area": area,
-            "aspect_ratio": aspect_ratio,
-            "area_ratio": area_ratio,
-            "density": density,
-            "contrast": contrast,
-            "brightness": brightness,
-            "n_chars": n_chars,
-            "white_ratio": white_ratio,
-            "score": score,
+            "contour": contour, "center": center, "size": (w, h), "angle": angle, "box": box,
+            "area": w * h, "aspect_ratio": aspect, "area_ratio": area_ratio,
+            "density": density, "contrast": contrast, "brightness": brightness,
+            "n_chars": n_chars, "white_ratio": white_ratio, "score": score,
         })
 
-    candidates.sort(key=lambda candidate: candidate["score"], reverse=True)
+    candidates.sort(key=lambda c: c["score"], reverse=True)
     if debug:
-        print(f"[filter] accepted={len(candidates)}, rejected={rejections}")
+        print(f"[filter] accepted={len(candidates)}")
     return candidates
+
+
+def _aabb_from_box(box):
+    xs = [p[0] for p in box]
+    ys = [p[1] for p in box]
+    return min(xs), min(ys), max(xs), max(ys)
+
+
+def _iou(a, b):
+    ax0, ay0, ax1, ay1 = a
+    bx0, by0, bx1, by1 = b
+    ix0 = max(ax0, bx0)
+    iy0 = max(ay0, by0)
+    ix1 = min(ax1, bx1)
+    iy1 = min(ay1, by1)
+    if ix0 >= ix1 or iy0 >= iy1:
+        return 0.0
+    inter = (ix1 - ix0) * (iy1 - iy0)
+    area_a = (ax1 - ax0) * (ay1 - ay0)
+    area_b = (bx1 - bx0) * (by1 - by0)
+    union = area_a + area_b - inter
+    return inter / union if union > 0 else 0.0
+
+
+def nms_candidates(candidates, iou_threshold=0.4):
+    if not candidates:
+        return []
+    aabbs = [_aabb_from_box(c["box"]) for c in candidates]
+    suppressed = [False] * len(candidates)
+    keep = []
+    for i in range(len(candidates)):
+        if suppressed[i]:
+            continue
+        keep.append(candidates[i])
+        for j in range(i + 1, len(candidates)):
+            if not suppressed[j] and _iou(aabbs[i], aabbs[j]) > iou_threshold:
+                suppressed[j] = True
+    return keep
