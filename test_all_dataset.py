@@ -43,7 +43,7 @@ def load_image(path: Path) -> np.ndarray:
 
 def process_image(path: Path) -> tuple[np.ndarray, OCRResult]:
     image = load_image(path)
-    candidates, _, _, _, _, _ = detect_plate_candidates(image)
+    candidates, _, _, _, _ = detect_plate_candidates(image)
 
     plate_images = [crop_plate(image, c["box"]) for c in candidates[:TOP_K_OCR]]
     ocr_result, ocr_idx = recognize_best_plate(plate_images)
@@ -65,8 +65,6 @@ def main() -> None:
 
     reset_results_dir(RESULTS_DIR)
 
-    total = 0
-    valid = 0
     for image_path in image_paths:
         try:
             result_image, ocr_result = process_image(image_path)
@@ -75,16 +73,9 @@ def main() -> None:
             continue
 
         cv2.imwrite(str(RESULTS_DIR / image_path.name), result_image)
-        total += 1
-        if ocr_result.valid:
-            valid += 1
-        tag = "VALID" if ocr_result.valid else "----"
-        print(f"[{tag}] {ocr_result.text!r:12s} conf={ocr_result.confidence:5.1f}  {image_path.name}")
+        print(f"{ocr_result.text!r:12s}  {image_path.name}")
 
-    if total:
-        print(f"Done. Valid plates: {valid}/{total} ({100.0 * valid / total:.1f}%)")
-    else:
-        print("Done")
+    print("Done")
 
 
 if __name__ == "__main__":

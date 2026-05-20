@@ -1,0 +1,32 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(.venv/Scripts/python.exe -c \"import morphology; import edges; import contours; import candidates; import ocr; import viz; import main; print\\('ALL MODULES OK'\\)\")",
+      "Bash(.venv/Scripts/python.exe -c ' *)",
+      "Bash(.venv/Scripts/python.exe __smoke.py)",
+      "Bash(.venv/Scripts/python.exe -c \"import morphology, edges, contours, candidates, ocr, viz, main; print\\('IMPORTS OK'\\)\")",
+      "Bash(.venv/Scripts/python.exe -c \"import morphology, edges, contours, candidates, ocr, viz, main, test_all_dataset; print\\('IMPORTS OK'\\)\")",
+      "Bash(.venv/Scripts/python.exe __bench.py 5)",
+      "Bash(.venv/Scripts/python.exe __bench.py 10)",
+      "Bash(.venv/Scripts/python.exe -c \"from main import detect_plate_candidates, crop_plate, TOP_K_OCR; print\\('OK'\\)\")",
+      "Bash(.venv/Scripts/python.exe -c \"import main, test_all_dataset, candidates; print\\('IMPORTS OK'\\)\")",
+      "Bash(.venv/Scripts/python.exe -c \"import main, test_all_dataset, ocr, viz; print\\('IMPORTS OK'\\)\")",
+      "Bash(.venv/Scripts/python.exe -c \"import main, test_all_dataset, candidates, ocr; print\\('IMPORTS OK'\\)\")",
+      "Bash(.venv/Scripts/python.exe -c \"import main, test_all_dataset, candidates, ocr, edges, morphology, contours, viz; print\\('IMPORTS OK'\\)\")",
+      "Bash(.venv/Scripts/python.exe -c \"import main, candidates, ocr; print\\('IMPORTS OK'\\)\")",
+      "Bash(.venv/Scripts/python.exe __bench.py)",
+      "Bash(.venv/Scripts/python.exe -c \"import reportlab; print\\('reportlab OK'\\)\")",
+      "Bash(.venv/Scripts/python.exe -c \"import matplotlib; print\\('matplotlib OK'\\)\")",
+      "Bash(.venv/Scripts/python.exe -m pip install reportlab)",
+      "Bash(.venv/Scripts/python.exe -c \"import reportlab; print\\('reportlab', reportlab.__version__\\)\")",
+      "Bash(.venv/Scripts/python.exe __make_pdf.py)",
+      "Bash(.venv/Scripts/python.exe -c \"import main, test_all_dataset, viz; print\\('IMPORTS OK'\\)\")",
+      "Bash(.venv/Scripts/python.exe -c \"import easyocr; print\\('easyocr', easyocr.__version__\\)\")",
+      "Bash(.venv/Scripts/python.exe -m pip install easyocr)",
+      "Bash(.venv/Scripts/python.exe -c \"import easyocr; print\\('easyocr OK', easyocr.__version__\\)\")",
+      "Bash(.venv/Scripts/python.exe -c \"import main, ocr; print\\('OK'\\)\")",
+      "Bash(.venv/Scripts/python.exe -c \"import main; print\\('OK'\\)\")",
+      "Bash(.venv/Scripts/python.exe -c \"import ocr; print\\('OK'\\)\")"
+    ]
+  }
+}

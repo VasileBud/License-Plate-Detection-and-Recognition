@@ -30,20 +30,20 @@ def draw_result_overlay(image, best_box, ocr_result: OCRResult):
     pts = np.array(best_box, dtype=np.int32)
     cv2.polylines(overlay, [pts], True, (0, 255, 0), 3)
     if ocr_result.text:
-        text = ocr_result.text if ocr_result.valid else f"{ocr_result.text} ?"
+        text = ocr_result.text
         x, y = pts[0]
         cv2.putText(overlay, text, (int(x), max(int(y) - 10, 20)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
     return overlay
 
 
-def show_debug_views(image, working, edges, closed, contours, candidates, best_box_original,
+def show_debug_views(image, edges, closed, contours, candidates, best_box_original,
                      plate_image, ocr_result, closing_kernel_shape, show_top_k):
     kh, kw = closing_kernel_shape
     views = {
         "1. Canny": edges,
         f"2. Closing {kh}x{kw}": closed,
-        "3. Contours": draw_contours_overlay(working, contours),
+        "3. Contours": draw_contours_overlay(image, contours),
         "4. Candidates": draw_candidates_overlay(image, candidates, show_top_k),
         "7. Result": draw_result_overlay(image, best_box_original, ocr_result),
     }

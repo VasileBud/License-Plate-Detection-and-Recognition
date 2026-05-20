@@ -12,14 +12,8 @@ from viz import close_debug_views, show_debug_views
 
 TOP_K = 5
 TOP_K_OCR = 3
-MAX_PROCESSING_DIM = 1200
-CLOSING_KERNEL_WIDTH_RATIO = 2
-NMS_IOU_THRESHOLD = 0.4
 SHOW_DEBUG_WINDOWS = True
 WAIT_KEY_MS = 0
-CLOSING_KERNEL_RATIO = 0.004
-MIN_PLATE_CROP_WIDTH_RATIO = 0.035
-MIN_PLATE_CROP_HEIGHT_RATIO = 0.012
 
 
 def select_image() -> str | None:
@@ -43,44 +37,20 @@ def load_image(path: str) -> cv2.typing.MatLike:
 
 
 def compute_closing_kernel(image_shape) -> int:
-    kernel = max(3, int(round((min(image_shape[:2]) * CLOSING_KERNEL_RATIO))))
+    kernel = max(3, int(round(min(image_shape[:2]) * 0.004)))
     return kernel + 1 if kernel % 2 == 0 else kernel
 
 
-def horizontal_closing_element(kh: int) -> np.ndarray:
-    kw = kh * CLOSING_KERNEL_WIDTH_RATIO
-    if kw % 2 == 0:
-        kw += 1
-    return np.ones((kh, kw), dtype=np.uint8)
-
-
 def detect_plate_candidates(image: np.ndarray):
-    h, w = image.shape[:2]
-    scale = min(1.0, MAX_PROCESSING_DIM / max(h, w))
-    if scale < 1.0:
-        new_w = int(round(w * scale))
-        new_h = int(round(h * scale))
-        working = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_AREA)
-    else:
-        working = image
-
-    gray = cv2.cvtColor(working, cv2.COLOR_BGR2GRAY)
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     edges = canny(gray)
-    kh = compute_closing_kernel(working.shape)
-    element = horizontal_closing_element(kh)
+    kh = compute_closing_kernel(image.shape)
+    element = np.ones((kh, kh), dtype=np.uint8)
     closed = closing(edges, element)
-    contours = find_contours(closed, contour_length_threshold(working.shape))
-    candidates = filter_plate_candidates(working, contours, edges, gray)
-    candidates = nms_candidates(candidates, NMS_IOU_THRESHOLD)
-
-    if scale < 1.0:
-        inv = 1.0 / scale
-        for c in candidates:
-            c["box"] = [(float(x * inv), float(y * inv)) for (x, y) in c["box"]]
-            c["center"] = (c["center"][0] * inv, c["center"][1] * inv)
-            c["size"] = (c["size"][0] * inv, c["size"][1] * inv)
-
-    return candidates, edges, closed, contours, working, element
+    contours = find_contours(closed, contour_length_threshold(image.shape))
+    candidates = filter_plate_candidates(image, contours, edges, gray)
+    candidates = nms_candidates(candidates, 0.4)
+    return candidates, edges, closed, contours, element
 
 
 def crop_plate(image: np.ndarray, box) -> np.ndarray | None:
@@ -88,7 +58,7 @@ def crop_plate(image: np.ndarray, box) -> np.ndarray | None:
     w = int(max(np.linalg.norm(src[1] - src[0]), np.linalg.norm(src[2] - src[3])))
     h = int(max(np.linalg.norm(src[3] - src[0]), np.linalg.norm(src[2] - src[1])))
     img_h, img_w = image.shape[:2]
-    if w < max(30.0, img_w * MIN_PLATE_CROP_WIDTH_RATIO) or h < max(10.0, img_h * MIN_PLATE_CROP_HEIGHT_RATIO):
+    if w < max(30.0, img_w * 0.035) or h < max(10.0, img_h * 0.012):
         return None
     dst = np.array([[0, 0], [w - 1, 0], [w - 1, h - 1], [0, h - 1]], dtype=np.float32)
     return cv2.warpPerspective(image, cv2.getPerspectiveTransform(src, dst), (w, h))
@@ -115,9 +85,7 @@ def print_summary(contours, candidates, best, plate_image, ocr_result: OCRResult
         print("A plate-like region was detected, but cropping failed or the ROI is too small.")
         return
     if ocr_result.text:
-        validity = "valid" if ocr_result.valid else "invalid"
-        print(f"OCR: {ocr_result.text} ({validity}, variant={ocr_result.variant}, "
-              f"score={ocr_result.score:.2f}, confidence={ocr_result.confidence:.0f})")
+        print(f"OCR: {ocr_result.text}")
     else:
         print("OCR: no result.")
 
@@ -129,7 +97,7 @@ def main() -> None:
         sys.exit(0)
 
     image = load_image(path)
-    candidates, edges, closed, contours, working, element = detect_plate_candidates(image)
+    candidates, edges, closed, contours, element = detect_plate_candidates(image)
 
     plate_images = [crop_plate(image, c["box"]) for c in candidates[:TOP_K_OCR]]
     ocr_result, ocr_idx = recognize_best_plate(plate_images)
@@ -151,7 +119,7 @@ def main() -> None:
     print_summary(contours, candidates, best, plate_image, ocr_result, ocr_idx)
 
     if SHOW_DEBUG_WINDOWS:
-        show_debug_views(image=image, working=working, edges=edges, closed=closed,
+        show_debug_views(image=image, edges=edges, closed=closed,
                          contours=contours, candidates=candidates,
                          best_box_original=best_box, plate_image=plate_image,
                          ocr_result=ocr_result, closing_kernel_shape=element.shape,
