@@ -2,12 +2,13 @@ from collections import deque
 import cv2
 import numpy as np
 
-
+# calculeaza cate puncte trebuie sa aiba un contur ca sa fie luat in considerare
+# intr-o imagine de 1000 pixeli, conturul e minim 15 puncte
 def contour_length_threshold(img_shape) -> int:
     min_dim = min(img_shape[0], img_shape[1])
     return max(10, int(round(min_dim * 0.010)))
 
-
+#ca functia anterioara, pnntru inaltimea si latimea minima / maxima a unei placute
 def plate_size_thresholds(img_shape):
     h, w = img_shape[:2]
     min_h = max(8.0, h * 0.008)
@@ -15,7 +16,8 @@ def plate_size_thresholds(img_shape):
     max_h = max(min_h, h * 0.25)
     return min_h, min_w, max_h
 
-
+# sorteaza colturile: top-left, top_right, bottom_right, bottom_left
+# opencv asteapta colturile intr-o ordine fixata
 def order_4_points(points):
     pts = np.asarray(points, dtype=np.float32)
     sums = pts.sum(axis=1)
@@ -27,7 +29,9 @@ def order_4_points(points):
         pts[np.argmax(diffs)],
     ], dtype=np.float32)
 
-
+#calculeaza latimea ca distanta intre colturile de sus
+#calculeaza inaltimea ca distanta intre colturile din stanga / dreapta
+#warpPerspective indreapta regiunea intr-un dreptunghi w x h
 def warp_roi(src, box):
     pts = order_4_points(box)
     w = int(max(np.linalg.norm(pts[1] - pts[0]), np.linalg.norm(pts[2] - pts[3])))
@@ -37,14 +41,17 @@ def warp_roi(src, box):
     dst = np.array([[0, 0], [w - 1, 0], [w - 1, h - 1], [0, h - 1]], dtype=np.float32)
     return cv2.warpPerspective(src, cv2.getPerspectiveTransform(pts, dst), (w, h))
 
-
+#verifica daca dreptunghiul e mai lat decat inalt
 def has_horizontal_span(box) -> bool:
     pts = np.asarray(box, dtype=np.float64)
     sx = pts[:, 0].max() - pts[:, 0].min()
     sy = pts[:, 1].max() - pts[:, 1].min()
     return sx >= sy
 
-
+#converteste din BGR in HSV si creeaza o masca binara
+#unde pixelii albi (saturatie scazuta, valoare mare) devin 255
+#ceilalti 0
+# pt ca placutele de romania au mult alb, deci alb => semn bun
 def compute_white_mask(bgr_image):
     hsv = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2HSV)
     low = np.array((0, 0, 120), np.uint8)
@@ -87,7 +94,9 @@ def label_components_bfs(binary_image):
                 components.append((min_i, min_j, max_i, max_j, count))
     return components
 
-
+# folosit la scoring
+# binarizeaza ROI (pixelii sub medie devin albi) => text
+# numara cate componente trec filtrul de caractere
 def count_characters_roi(gray_roi) -> int:
     h, w = gray_roi.shape
     if h < 8 or w < 20:
@@ -103,7 +112,7 @@ def count_characters_roi(gray_roi) -> int:
             count += 1
     return count
 
-
+# scor in functie de cate caractere sunt detectate
 def score_text(n_chars: int) -> float:
     if n_chars < 3 or n_chars > 14:
         return 0.0
@@ -116,6 +125,8 @@ def score_text(n_chars: int) -> float:
 
 def min_area_rect_pca(points):
     pts = np.asarray(points, dtype=np.float64)
+    # < 3 puncte => nu putem face PCA
+    # deci returnam un dreptunghi aliniat simplu
     if len(pts) < 3:
         x0, y0 = pts.min(axis=0)
         x1, y1 = pts.max(axis=0)
@@ -123,26 +134,42 @@ def min_area_rect_pca(points):
         corners = [(x0, y0), (x0 + w, y0), (x0 + w, y0 + h), (x0, y0 + h)]
         return ((x0 + w / 2, y0 + h / 2), (w, h), 0.0, corners)
 
+    # centroid = media pe fiecare axa
     centroid = pts.mean(axis=0)
+    # mutam originea in centroid
     centered = pts - centroid
+
+    # matricea de covarianta = cat de raspandite sunt punctele si in ce directie
     cov = (centered.T @ centered) / len(pts)
+
+    # vectorii proprii
+    # ne dau unghiul de inclinare al norului de punct
     _, eigvecs = np.linalg.eigh(cov)
     angle = float(np.arctan2(eigvecs[1, -1], eigvecs[0, -1]))
 
+    # rotim incat axa principala sa devina orizontala
     cos_a, sin_a = np.cos(-angle), np.sin(-angle)
     rot = np.array([[cos_a, -sin_a], [sin_a, cos_a]])
     aligned = centered @ rot.T
+
+    # pe punctele rotite, dreptunghiul = min/max pe fiecare axa
     min_xy = aligned.min(axis=0)
     max_xy = aligned.max(axis=0)
     w = float(max(max_xy[0] - min_xy[0], 1))
     h = float(max(max_xy[1] - min_xy[1], 1))
 
+    # rotire inapoi si translatie la pozitia reala
     rot_back = rot.T
+
+    # cele 4 colturi ale dreptunghiului
     local = np.array([[min_xy[0], min_xy[1]], [max_xy[0], min_xy[1]],
                       [max_xy[0], max_xy[1]], [min_xy[0], max_xy[1]]])
+
+    # rotim inapoi la unghiul original si translatam la centroid
     corners = local @ rot_back.T + centroid
     center = (min_xy + max_xy) / 2 @ rot_back.T + centroid
 
+    # returnam centru, dimensiuni, unghi, colturi
     return (
         (float(center[0]), float(center[1])),
         (w, h),
@@ -165,7 +192,7 @@ def _score(aspect, density, contrast, brightness, n_chars, white_ratio):
     white = min(1.0, white_ratio / 0.60)
     return ar * 2.5 + dens * 2.0 + contr * 3.0 + bright * 2.0 + text * 2.5 + white * 2.0
 
-
+    # pipeline
 def filter_plate_candidates(img, contours, edges, gray, debug=False):
     img_h, img_w = img.shape[:2]
     img_area = img_h * img_w
@@ -245,7 +272,10 @@ def _iou(a, b):
     union = area_a + area_b - inter
     return inter / union if union > 0 else 0.0
 
-
+# cand mai multe contururi detecteaza aceeasi placuta
+# ajung cu candidati suprapusi
+# nms_candidates parcurge candidatii de la cel mai bun scor in jos si
+# suprima candidatii ulteriori care se suprapun cu IoU > 0.4
 def nms_candidates(candidates, iou_threshold=0.4):
     if not candidates:
         return []

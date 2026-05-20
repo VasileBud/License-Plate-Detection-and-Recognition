@@ -29,7 +29,8 @@ def gaussian_kernel(width, sigma):
             kernel[y, x] = (1.0 / (2.0 * np.pi * sigma * sigma)) * np.exp(
                 -((x - center) ** 2 + (y - center) ** 2) / (2.0 * sigma * sigma)
             )
-
+    # normalizam ca suma ponderilor sa fie 1
+    # altfel convolutia ar afecta luminiozitatea
     total = 0.0
     for y in range(width):
         for x in range(width):
@@ -45,6 +46,7 @@ def gaussian_filter(img, width=5):
 
 
 def sobel(img):
+    # detectia variatiilor orizontale si verticale
     kernel_x = np.array([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=np.float64)
     kernel_y = np.array([[1, 2, 1], [0, 0, 0], [-1, -2, -1]], dtype=np.float64)
     grad_x = convolution(img, kernel_x)
@@ -72,7 +74,8 @@ def direction_bin(angle):
         return 2
     return 3
 
-
+#subtiem muchiile la un singur pixel grosime
+#verificand cei 2 vecini de-a lungul directiei
 def keep_local_max(magnitude, direction):
     rows, cols = magnitude.shape
     result = np.zeros((rows, cols), dtype=np.float64)
@@ -95,7 +98,8 @@ def keep_local_max(magnitude, direction):
                 result[i, j] = magnitude[i, j]
     return result
 
-
+#calculul pragului folosind histograma magnitudinilor
+#pastram 10% din pixelii non-zero ca muchii sigure
 def adaptive_binarization(nms_magnitude, p=0.1):
     rows, cols = nms_magnitude.shape
     normalized = np.zeros((rows, cols), dtype=np.int32)
@@ -124,7 +128,10 @@ def adaptive_binarization(nms_magnitude, p=0.1):
             break
     return threshold, normalized
 
-
+#pixel > high => muchie sigura
+#pixel < low => eliminati
+#pixeli intre low si high sunt candidati
+#candidatii conectati la muchii sigure sunt promovati
 def hysteresis(magnitude_map, high_threshold, k=0.4):
     rows, cols = magnitude_map.shape
     low_threshold = k * high_threshold
